@@ -1,6 +1,9 @@
 package com.lagradost.cloudstream3.utils
 
 import android.app.Activity
+import android.app.AlertDialog
+import android.os.Build
+import android.os.Environment
 import android.content.Context
 import android.net.Uri
 import android.widget.Toast
@@ -41,6 +44,7 @@ import com.lagradost.safefile.SafeFile
 import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
 import okhttp3.internal.closeQuietly
+import java.io.File
 import java.io.IOException
 import java.io.OutputStream
 import java.io.PrintWriter
@@ -290,8 +294,15 @@ object BackupUtils {
         }
     }
 
-    fun Activity.restorePrompt() {
-        runOnUiThread {
+    /**
+     * Restore from the public Downloads directory without launching DocumentsUI.
+     *
+     * Android 11+ devices with a broken system document picker can use this
+     * fallback. The existing OpenDocument picker remains available on older
+     * Android versions. Backup JSON parsing and restore semantics are unchanged.
+     */
+    private fun Activity.restoreFromDownloads() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) {
             restoreFileSelector?.launchSafe(
                 arrayOf(
                     "text/plain",
@@ -303,6 +314,86 @@ object BackupUtils {
                     "application/octet-stream",
                 )
             )
+            return
+        }
+
+        if (!Environment.isExternalStorageManager()) {
+            AlertDialog.Builder(this)
+                .setTitle(R.string.restore_settings)
+                .setMessage("Allow CloudStream to access files so it can find backups in Downloads. Then return here and choose Restore again.")
+                .setNegativeButton(android.R.string.cancel, null)
+                .setPositiveButton("Open settings") { _, _ ->
+                    try {
+                        val intent = android.content.Intent(
+                            android.provider.Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION,
+                            Uri.parse("package:$packageName")
+                        )
+                        startActivity(intent)
+                    } catch (e: Exception) {
+                        logError(e)
+                        showToast("Unable to open file access settings", Toast.LENGTH_LONG)
+                    }
+                }
+                .show()
+            return
+        }
+
+        val downloads = Environment.getExternalStoragePublicDirectory(
+            Environment.DIRECTORY_DOWNLOADS
+        )
+        val backups = downloads.listFiles()
+            ?.filter {
+                it.isFile &&
+                    it.name.startsWith("CS3_Backup_") &&
+                    it.extension.equals("txt", ignoreCase = true)
+            }
+            ?.sortedByDescending { it.lastModified() }
+            .orEmpty()
+
+        if (backups.isEmpty()) {
+            showToast("No CS3_Backup_*.txt files found in Downloads", Toast.LENGTH_LONG)
+            return
+        }
+
+        val labels = backups.map { it.name }.toTypedArray()
+        AlertDialog.Builder(this)
+            .setTitle("Select CloudStream backup")
+            .setItems(labels) { _, which ->
+                backups.getOrNull(which)?.let { restoreFromBackupFile(it) }
+            }
+            .setNegativeButton(android.R.string.cancel, null)
+            .show()
+    }
+
+    private fun Activity.restoreFromBackupFile(file: File) {
+        val activity = this
+        ioSafe {
+            try {
+                val restoredValue = file.inputStream().bufferedReader().use {
+                    parseJson<BackupFile>(it.readText())
+                }
+                restore(
+                    activity,
+                    restoredValue,
+                    restoreSettings = true,
+                    restoreDataStore = true,
+                )
+                activity.runOnUiThread { activity.recreate() }
+            } catch (e: Exception) {
+                logError(e)
+                main {
+                    showToast(
+                        activity.getString(R.string.restore_failed_format).format(e.toString()),
+                        Toast.LENGTH_LONG
+                    )
+                }
+            }
+        }
+    }
+
+    fun Activity.restorePrompt() {
+        runOnUiThread {
+            restoreFromDownloads()
         }
     }
 
